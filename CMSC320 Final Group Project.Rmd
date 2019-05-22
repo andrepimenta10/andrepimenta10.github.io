@@ -1,0 +1,250 @@
+---
+title: "Final Project"
+author: "Andre Pimenta, Allie Buller, Aaron Berman"
+date: "May 22, 2019"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(tidyverse)
+library(xtable)
+library(broom)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(magrittr)
+library(readxl)
+library(knitr)
+library(stringr)
+library(randomForest)
+library(DT)
+library(kableExtra)
+library(data.table)
+library(Hmisc)
+library(corrplot)
+library(lmtest)
+library(sandwich)
+```
+The first step in in the data science process is to determine what question you want to evaluate. One of the members of our group was particularly interested in stock trends, and the other two members were interested in learning more about the topic, so we decided to focus on the task of predicting yearly returns. More specifically, we wanted to find a model that predicts the change in stock price from one year to the next. 
+
+After defining a problem you want to solve, the next step is finding a dataset that you can get meaningful information from. We found a dataset from quandl, which contains yearly stock data in a csv format. To begin working with the file, download the data from https://drive.google.com/file/d/1Z1eI8qwAeTxUuo7eJy9mQrIs1Tsn4H9y/view?usp=sharing. Next, input the data into R as a data table. In our data frame, the entities (rows) represent yearly stocks, and the attributes (columns) represent different information about the stocks, including date information, identifying information, and financial information. 
+
+```{r load_data, message=FALSE}
+Data <- as.data.table(read_csv("/Users/andrepimenta/Downloads/ARYearly.csv"))
+```
+
+Some of the attributes that will come up include the following: 
+
+ROE: Return on Equity - How much equity is required to generate a certain amount of net income?
+ROA: Return on Assets - How much in assets is required to generate a certain amount of income?
+FCF: Free Cash Flow - What is a company’s discretionary cash flow each year?
+ROIC: Return on Invested Capital: How much in income for all its investors does a company generate with all its capital?
+P/E Ratio: Price-to-Earnings Ratio - Ratio for valuing a company that measures its current share price relative to its per-share earnings
+PB: Price-to-Book - A ratio of the share price of a publicly-traded company to its book value per share, which is the company’s total asset value less the value of its liabilities
+DPS: Dividend Per Share - The sum of declared dividends issued by a company for every share outstanding 
+https://breakingintowallstreet.com/biws/kb/financial-statement-analysis/roic-vs-roe-and-roe-vs-roa/
+https://breakingintowallstreet.com/biws/kb/financial-statement-analysis/free-cash-flow-example/
+https://www.investopedia.com/terms/p/price-earningsratio.asp
+https://financial-dictionary.thefreedictionary.com/P-B+Ratio
+https://www.investopedia.com/terms/d/dividend-per-share.asp
+
+As part of the preprocessing stage, categorize each entity based on its market cap. According to Investopedia, market capitalization, or market cap, is the total dollar market value of a company’s outstanding shares. To calculate a company’s market cap, multiply their shares outstanding by the current market price per share. As is a typical practice, we will use market cap to indicate each company’s size. For more information on market capitalization and classification, please read https://www.investopedia.com/terms/m/marketcapitalization.asp. 
+
+This step will be important later on, when we group by market cap. In order to create a market cap column, you will need to use the cut function in R. RDocumentation explains that “cut divides the range of x into intervals and codes the values in x according to which interval they fall. The leftmost interval corresponds to level one, the next leftmost to level two and so on.” In our case, we will be dividing the “marketcap” into the numeric intervals provided by the “levels” vector. These have been respectively labeled based on the corresponding capitalization group: nano, micro, small, mid, and large. These cutoffs and labels are based on industry norms outlined in the article above. 
+
+We will then use the mutate function to create a new column in our dataframe, entitled “capGroup”, which contains the label of the market cap group corresponding to the entity. 
+
+```{r format_data, message=FALSE}
+# classify different market caps
+levels <- c(0, 50e6, 300e6, 2e9, 10e9, Inf)
+labels <- c("nano", "micro", "small", "mid", "large")
+Data <- Data %>% mutate(capGroup = cut(marketcap, levels, labels = labels))
+```
+
+We want to make a few changes to the dataframe. We want a numeric column, “year”, since we are concerned with yearly changes. Since the datatype of “calendardate” is datetime, we can extract the year. Next, we want to select the attributes that we think will be useful later. We chose “roe”, “roa”, “fcf”, “roic”, “pe”, “pb”, “calendardate”, “year”, “ticker”, “price”, “dps”, “marketcap”, and “capGroup”. We are choosing these features because they are typically related to returns. This makes sense economically, as companies that are more profitable (as indicated by return on equity, return on assets, and return on invested capital), companies with high free cash flow, and companies with high value (as indicated by the price-to-book and price-to-earning ratios), should generally outperform other companies. 
+
+Next, we want to create an attribute that calculates the actual yearly return to compare to the yearly return our model is predicting. The formula for yearly return is current share price plus dividend per share, divided by the price of the previous year, minus 1. We create a column “prevPrice” that is the price corresponding to the stock with the same ticker, from the year prior. This is used in the yearly return calculation. We will also calculate the next yearly return by taking the yearly return of the company’s stock for the following year. This next yearly return is what we are going to compare against what we predict with our model. 
+
+We also need to account for extreme values. Replace any extreme value with the farthest non-outlier value. This technique is refered to as winsorizing, which you can read about here: https://www.statisticshowto.datasciencecentral.com/winsorize/. Winsorizing makes our model more robust to outliers. Accountingn for outliers is an important part of preprocessing. 
+
+```{r filter_data, message=FALSE}
+Data <- Data %>% 
+  mutate(year = as.numeric(format(as.Date(calendardate, format="%Y-%m-%d"), "%Y"))) %>%
+  select(roe, roa, fcf, roic, pe, pb, calendardate, year, ticker, price, dps, marketcap, capGroup) %>%
+  arrange(ticker, desc(as.Date(Data$calendardate, format="%d/%m/%Y"))) %>%
+  group_by(ticker) %>% 
+  mutate(prevPrice = shift(price, n=-1)) %>%
+  mutate(yearlyRet = (price + dps) / prevPrice - 1) %>%
+  mutate(NextYearlyRet = shift(yearlyRet)) %>% 
+  filter(year > 1998 & year < 2018) %>% # not many datapoints outside this range
+  filter(price > 1) # filter out penny stocks
+Data <- na.omit(as.data.table(Data))
+
+# winsorize regressors
+Wins <- function(x, left, right) { 
+  q <- quantile(x, c(left,right), type = 5)
+  indx <- findInterval(x, q,left.open = TRUE)
+  x[indx == 0] <- q[[1]]
+  x[indx == 2] <- q[[2]]
+  x
+}
+
+# clean data with winsorizing, not removing but changing outliers to farthest non outlier value
+Xfactors <- colnames(Data)[c(1:6)]
+Data <- Data[, c(.(capGroup=capGroup, ticker = ticker, NextYearlyRet=NextYearlyRet), lapply(.SD, function(x) Wins(as.numeric(x), 0.05,0.95))), by = "year", .SDcols = Xfactors]
+
+```
+
+We then want to find which variables might be correlated to the yearly return variable, "NextYearlyRet" that we just calculated. First, transform the data to get the z score. Each z score is calculated by subtracting the mean of the feature from the value, and dividing by its standard deviation. This ensures each scaled feature has a center of 0 and a standard deviation of 1. Using these scaled values, we want to find the correlation between each variable and the yearly return. From here, we find the mean correlation per feature over the years in order to determine which features to use in our model. If the p-value is significant, this means that that variable is significantly related to the yearly return. As we should be able to see from the table, the relationship between each variable and our yearly return is significant. This is indicated by p-values close to 0. This tells us that these variable would be good to use in our linear regression, since we want to use variables that have a relationship with yearly returns. 
+
+Notice that we performed the Spearman correlation, instead of a typical Pearson correlation. This is because Spearman correlations capture relationships that are not necessarily strictly linear. Rather, it measures monotonic relationships. Since the relationships between our variables may be monotonic, but not linear, we wanted to still capture these as potential predictors in our model. A good resource to learn more about monotonic relationships and Spearman's correlation is: 
+https://statistics.laerd.com/statistical-guides/spearmans-rank-order-correlation-statistical-guide.php. 
+
+```{r correlation}
+# Z-scoring
+Data <- Data[, paste0("z", Xfactors) := lapply(.SD, function(x) as.vector(scale(as.numeric(x)))),.SDcols = Xfactors, by = .(year)]
+
+# correlation of feature to return per year
+ZX_factors <- paste0("z", Xfactors)
+corrs <- Data[, lapply(.SD, function(x) cor(NextYearlyRet, x, method = "spearman")),.SDcols = ZX_factors, by = "year"][, year := NULL]
+
+# mean correlation per feature over the years -- shows which variables might be correlated with returns
+model <- lm(as.matrix(corrs) ~ 1)
+model %>% tidy()
+
+# Spearman correlation of each factor to returns
+coeftest(model, vcov = NeweyWest(model, lag = 1, prewhite = F))
+```
+
+Using the features that we found to be correlated above, create a model to predict "NextYearlyRet". Begin with a multiple linear regression model, since we want to model the relationship between multiple predictors and our response variable, next yearly return. The data frame generated provides the least-squares estimate, standard error, t-statistic, and p-value for each predictor variable. For more information on multiple linear regressions and their output, read: http://www.stat.yale.edu/Courses/1997-98/101/linmult.htm 
+
+Our null hypothesis is that there is no relationship between yearly regression and any of the predictors. This is the same as saying that the coefficient for each variable is equal to 0. In our model, all of the variables are significant, as indicated by the p-values of the t tests. This means we reject the null hypothesis for each, since the coefficient for each variable is significantly different from 0.  
+
+Look to see if any of our variables are related to each other. If they are, we would need to add interaction terms to our model. Return on equity, return on assets, and return on invested capital are all somewhat related, as shown by dot size in the correlation graph below. 
+
+```{r model_1}
+#Multiple linear regression
+mlr1 <- lm(NextYearlyRet ~ zroe + zroa + zfcf + zroic + zpe + zpb, data=Data)
+mlr1 %>% tidy()
+
+# correlation matrix to look for possibly redundant factors
+featuresDF <- Data %>% select(11:16)
+
+corr1 <- round(cor(featuresDF),2)
+corr2 <- rcorr(as.matrix(featuresDF))
+
+# ROE, ROA, and ROIC all somewhat correlated
+corrplot(corr2$r, type="upper", order="hclust", 
+         tl.col = "black", tl.srt = 45,
+         p.mat = corr2$P, sig.level = 0.01, insig = "blank")
+```
+
+Now that we know there is a relationship between return on equity, return on assets, and return on invested capital, add interaction terms to the model. Interaction terms are added as products. http://www.sthda.com/english/articles/40-regression-analysis/164-interaction-effect-in-multiple-regression-essentials/ provides a good example and explanation of adding interaction terms to your model, as well as the R code to do so.
+
+Determine which model is better -- the original model, or the interaction model. We will use an ANOVA test to compare the two models. Our null hypothesis is that our second model does not perform better than the first model. We will use the ANOVA to test this hypothesis by checking if there is in fact a difference between the two models. If the statistic, which in this case is the F-statistic, is significant, we will reject the null hypothesis. As the results show, the statistic is significant and positive, which means that the second model performs significanlty better than the original model. 
+
+```{r model_2, message=FALSE}
+# Model with interatctions for the correlated variables (zroe,zroic,zroa) 
+mlr2 <- lm(NextYearlyRet ~ zroe*zroic*zroa + zfcf + zpe + zpb, data=Data)
+
+# zfcf and interactions with zroa are not significant
+mlr2 %>% tidy()
+
+# Interaction model is better than the previous one
+anova(mlr1, mlr2)
+
+```
+
+Continue improving our model. From the p-values of the t-statistic in the interaction model, we see that free cash flow and the interactions with return on assets are not significant. Create a new model, this time removing these insignificant variables. Now, we want to perform an ANOVA between the previous model and this one, again with the null hypothesis that there is no improvement. As was the case between the first and second model, the p-value of the new model is significant, allowing us to reject the null hypothesis. Thus, there is evidence that the newest model, accounting for the insignificant variables and interactions, is better than the previous models. 
+
+
+```{r model_3}
+# New model removing insignificant variables and interactions
+mlr3 <- lm(NextYearlyRet ~ zroe*zroic + zroa + zpe + zpb, data=Data)
+mlr3 %>% tidy()
+
+# New model is better than the previous
+anova(mlr2, mlr3)
+```
+
+Now that we have tuned our model, it is time to visualize our results. We will do this by making residual plots. A residual is the difference between observed value and predicted value. In our case, it is the difference between the follow year's actual yearly return and that predicted by the model. We plot the residuals on the y-axis and the independent variable on the x-axis. If the points are randomly spread around the x-axis, this indicates that the linear model is a good fit for our data. If this does not make sense, you can gain a basic understanding of residuals here: https://stattrek.com/regression/residual-analysis.aspx.
+
+Examine the relationships between the residuals and different variables. Consider grouping by year and cap group to see if these have any impact. We begin by plotting the residuals by year. As the graph indicates, there is a large skew in the residual for 2008-2009. This makes sense, as the stock market crashed during this time. Thus, it makes sense why there would be a large difference between observed and predicted values, since this was an erratic time for the stock market. 
+
+Look at residual vs return on equity, since this is one of our primary predictors. Using the cap groups we created in our preprocessing step, we can get a better understanding of the relationship between market cap and our model. While the points belonging to small, mid, and large cap companies seem to lie around the horizontal axis, there appears to be large variance in the residuals for nano and micro cap stocks. This indicates that we need to group by market cap in order to get a better understanding of the information. It is pretty customary to group by market cap when analyzing investments, since there are big difference between stocks of really small and really large companies. It makes more sense to compare stocks whose companies are similarly sized in order to make predictions about the performance of the stocks.
+
+The third graph shows how the residuals depend on the cap group. The larger the company, the better the residual plot is. This makes sense, since the smallest companies may be less predictable overall, and thus their stocks would be less predictable in turn. Our final plot demonstrates this relationship, showing that it is best to group by cap group, since the relationship between return on equity and next year's return is different depending on the group. 
+
+```{r augment, message=FALSE}
+augmented <- mlr3 %>% augment()
+
+Data <- as.data.frame(Data)
+merged <- merge(Data, augmented, by="row.names")
+
+# Shows how the residuals are extremely bad in 2008-2009 (stock market crashed)
+merged %>%
+  ggplot(mapping=aes(x=factor(year), y=.resid)) +
+  geom_violin() +
+  labs(title="residuals vs. year ",
+       x = "year",
+       y = "residual") +
+  scale_x_discrete(breaks=seq(1980, 2015, 5))
+
+# Residuals are worst for nano and micro stocks - shows the need to group by market cap
+merged %>%
+  ggplot(mapping=aes(x=roe, y=.resid, color=capGroup)) +
+  geom_point() + 
+  geom_smooth(method=lm) +
+  labs(title="residuals vs. roe ",
+       x = "roe",
+       y = "residual")
+
+# Shows how the residuals depend on capGroup
+merged %>%
+  ggplot(mapping=aes(x=factor(capGroup), y=.resid)) +
+  geom_violin() +
+  labs(title="residuals vs. capGroup ",
+       x = "capGroup",
+       y = "residual")
+
+#Shows that the trend between zroe and nextYearlyRet depends on capGroup
+merged %>%
+  group_by(capGroup, ticker) %>%
+  summarise(meanNextYearlyRet = mean(NextYearlyRet.x), meanroe = mean(zroe.x)) %>%
+  ggplot(aes(x=meanroe, y = meanNextYearlyRet)) +
+    facet_wrap(~capGroup, scales = "free") +
+    geom_point() +
+    geom_smooth(method=lm)
+ 
+```
+
+Having seen that there may be different relationship depending on cap group, check to see if this is a predictor in the model. As before, our null hypothesis is that the coefficient for cap group will not be significantly different from 0. The p-values for each cap group is significant, so we will include it in our model. Remove insignificant terms, as we did before. 
+
+Graph the residuals. Although there is still some variance in the points, the residual suggests that this model is better than the previous ones, now that we have accounted for cap group. The ANOVA results suggest the same. 
+
+```{r regression, message=FALSE}
+# Regression using market cap as an independent variable
+mlr4 <- lm(NextYearlyRet ~ (zroe*zroic*zroa + zfcf + zpe + zpb + capGroup), data=Data)
+mlr4 %>% tidy()
+
+# Remove insignificant redundant features and add interaction term for cap group
+mlr5 <- lm(NextYearlyRet ~ (capGroup*zroic + zfcf + zpe + zpb), data=Data)
+mlr5 %>% tidy()
+
+#Residuals vs. Fitted values
+broom::augment(mlr5) %>%
+  ggplot(aes(x=.fitted, y=.resid)) +
+  geom_point()
+
+#F-test showing that the new regression is best
+anova(mlr3,mlr4)
+anova(mlr4, mlr5)
+
+```
+
+The goal of our analysis was to see if we could create a model that predicts a stock's next yearly return given yearly stock data. In the process, we began by preprocessing the data. We replaced outliears with less extreme values, selected features that we believed to be related, and added a column for market cap group to indicate size. Next, we began using a linear model. After performing correlations, we decided to test our hypothesis that some features may have had an interaction. We continued removing insignificant predictors from our model and tested whether we should group by cap group, ultimately arriving at a more fine tuned model. As we saw from our final residual plot, our linear model was an okay fit, but was by no means a perfect fit, as evident by the low R-squared value. However, we were able to create a model that did a relatively good job predicting next yearly returns from past stock information. 
+
+
